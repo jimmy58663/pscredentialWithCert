@@ -1,10 +1,10 @@
 Function Get-SmartCardCred{
 <#
 .SYNOPSIS
-Get certificate credentials from the user's certificate store.
+Get certificate credentials from the Windows logon UI.
 
 .DESCRIPTION
-Returns a PSCredential object of the user's selected certificate.
+Returns a PSCredential object of the user's selected account.
 
 .EXAMPLE
 Get-SmartCardCred
@@ -20,118 +20,114 @@ $Cred = Get-SmartCardCred
 
 .NOTES
 Author: Joshua Chase
-Last Modified: 01 August 2018
-C# code used from https://github.com/bongiovimatthew-microsoft/pscredentialWithCert
+Last Modified: 09 September 2019
+Version: 1.1.0
+C# signatures obtained from PInvoke.
 #>
 [cmdletbinding()]
-param()
-
-    $SmartCardCode = @"
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
-
+Param()
+    $Code = @"
 using System;
+using System.Text;
+using System.Security;
 using System.Management.Automation;
 using System.Runtime.InteropServices;
-using System.Security;
-using System.Security.Cryptography.X509Certificates;
-
-
-namespace SmartCardLogon{
-
-    static class NativeMethods
+public class Credentials
+{
+    private const int CREDUIWIN_GENERIC = 1;
+    private const int CREDUIWIN_CHECKBOX = 2;
+    private const int CREDUIWIN_AUTHPACKAGE_ONLY = 16;
+    private const int CREDUIWIN_IN_CRED_ONLY = 32;
+    private const int CREDUIWIN_ENUMERATE_ADMINS = 256;
+    private const int CREDUIWIN_ENUMERATE_CURRENT_USER = 512;
+    private const int CREDUIWIN_SECURE_PROMPT = 4096;
+    private const int CREDUIWIN_PACK_32_WOW = 268435456;
+    [DllImport("credui.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CredUIPromptForWindowsCredentials(ref CREDUI_INFO notUsedHere,
+        int authError,
+        ref uint authPackage,
+        IntPtr InAuthBuffer,
+        uint InAuthBufferSize,
+        out IntPtr refOutAuthBuffer,
+        out uint refOutAuthBufferSize,
+        ref bool fSave,
+        int flags);
+    [DllImport("credui.dll", CharSet = CharSet.Unicode)]
+    private static extern bool CredUnPackAuthenticationBuffer(int dwFlags,
+        IntPtr pAuthBuffer,
+        uint cbAuthBuffer,
+        StringBuilder pszUserName,
+        ref int pcchMaxUserName,
+        StringBuilder pszDomainName,
+        ref int pcchMaxDomainame,
+        StringBuilder pszKey,
+        ref int pcchMaxKey);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CREDUI_INFO
     {
-
-        public enum CRED_MARSHAL_TYPE
-        {
-            CertCredential = 1,
-            UsernameTargetCredential
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        internal struct CERT_CREDENTIAL_INFO
-        {
-            public uint cbSize;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)]
-            public byte[] rgbHashOfCert;
-        }
-
-        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        public static extern bool CredMarshalCredential(
-            CRED_MARSHAL_TYPE CredType,
-            IntPtr Credential,
-            out IntPtr MarshaledCredential
-        );
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        public static extern bool CredFree([In] IntPtr buffer);
-
+        public int cbSize;
+        public IntPtr hwndParent;
+        public string pszMessageText;
+        public string pszCaptionText;
+        public IntPtr hbmBanner;
     }
-
-    public class Certificate
+    public static PSCredential getPSCred()
     {
-
-        public static PSCredential MarshalFlow(string thumbprint, SecureString pin)
+        bool save = false;
+        int authError = 0;
+        uint result;
+        uint authPackage = 0;
+        IntPtr outCredBuffer;
+        uint outCredSize;
+        PSCredential psCreds = null;
+        var credui = new CREDUI_INFO
+                                {
+                                    pszCaptionText = "Enter your credentials",
+                                    pszMessageText = "These credentials will be used for Get-SmartCardCred"
+                                };
+        credui.cbSize = Marshal.SizeOf(credui);
+        while (true) //Show the dialog again and again, until Cancel is clicked or the entered credentials are correct.
         {
-            //
-            // Set up the data struct
-            //
-            NativeMethods.CERT_CREDENTIAL_INFO certInfo = new NativeMethods.CERT_CREDENTIAL_INFO();
-            certInfo.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.CERT_CREDENTIAL_INFO));
-
-            //
-            // Locate the certificate in the certificate store 
-            //
-            X509Certificate2 certCredential = new X509Certificate2();
-            X509Store userMyStore = new X509Store(StoreName.My, StoreLocation.CurrentUser);
-            userMyStore.Open(OpenFlags.ReadOnly);
-            X509Certificate2Collection certsReturned = userMyStore.Certificates.Find(X509FindType.FindByThumbprint, thumbprint, false);
-            userMyStore.Close();
-
-            if (certsReturned.Count == 0)
+            //Show the dialog
+            result = CredUIPromptForWindowsCredentials(ref credui,
+            authError,
+            ref authPackage,
+            IntPtr.Zero,
+            0,
+            out outCredBuffer,
+            out outCredSize,
+            ref save,
+            CREDUIWIN_ENUMERATE_CURRENT_USER);
+            if (result != 0) break;
+            var usernameBuf = new StringBuilder(100);
+            var keyBuf = new StringBuilder(100);
+            var domainBuf = new StringBuilder(100);
+            var maxUserName = 100;
+            var maxDomain = 100;
+            var maxKey = 100;
+            if (CredUnPackAuthenticationBuffer(1, outCredBuffer, outCredSize, usernameBuf, ref maxUserName, domainBuf, ref maxDomain, keyBuf, ref maxKey))
             {
-                throw new Exception("Unable to find the specified certificate.");
+                Marshal.ZeroFreeCoTaskMemUnicode(outCredBuffer);
+                var key = new SecureString();
+                foreach (char c in keyBuf.ToString())
+                {
+                    key.AppendChar(c);
+                }
+                keyBuf.Clear();
+                key.MakeReadOnly();
+                psCreds = new PSCredential(usernameBuf.ToString(), key);
+                GC.Collect();
+                break;
             }
-
-            //
-            // Marshal the certificate 
-            //
-            certCredential = certsReturned[0];
-            certInfo.rgbHashOfCert = certCredential.GetCertHash();
-            int size = Marshal.SizeOf(certInfo);
-            IntPtr pCertInfo = Marshal.AllocHGlobal(size);
-            Marshal.StructureToPtr(certInfo, pCertInfo, false);
-            IntPtr marshaledCredential = IntPtr.Zero;
-            bool result = NativeMethods.CredMarshalCredential(NativeMethods.CRED_MARSHAL_TYPE.CertCredential, pCertInfo, out marshaledCredential);
-
-            string certBlobForUsername = null;
-            PSCredential psCreds = null;
-
-            if (result)
-            {
-                certBlobForUsername = Marshal.PtrToStringUni(marshaledCredential);
-                psCreds = new PSCredential(certBlobForUsername, pin);
-            }
-
-            Marshal.FreeHGlobal(pCertInfo);
-            if (marshaledCredential != IntPtr.Zero)
-            {
-                NativeMethods.CredFree(marshaledCredential);
-            }
-            
-            return psCreds;
+              
+            else authError = 1326; //1326 = 'Logon failure: unknown user name or bad password.' 
         }
+        return psCreds;
     }
 }
 "@
 
-    Add-Type -TypeDefinition $SmartCardCode -Language CSharp
-    Add-Type -AssemblyName System.Security
+    Add-Type -TypeDefinition $Code -Language CSharp
 
-    $ValidCerts = [System.Security.Cryptography.X509Certificates.X509Certificate2[]](Get-ChildItem 'Cert:\CurrentUser\My')
-    $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2UI]::SelectFromCollection($ValidCerts, 'Choose a certificate', 'Choose a certificate', 0)
-
-    $Pin = Read-Host "Enter your PIN: " -AsSecureString
-
-    Write-Output ([SmartCardLogon.Certificate]::MarshalFlow($Cert.Thumbprint, $Pin))
+    Write-Output ([Credentials]::getPSCred())
 }
